@@ -1,0 +1,2081 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local globalEnv = (getgenv and getgenv()) or _G
+
+pcall(function()
+    if globalEnv.SystemCoreCleanup then
+        globalEnv.SystemCoreCleanup()
+    end
+end)
+
+local player = Players.LocalPlayer
+local playerGui = player:FindFirstChild("PlayerGui") or CoreGui
+
+if playerGui:FindFirstChild("SystemCoreFX") then
+    playerGui.SystemCoreFX:Destroy()
+end
+
+if Workspace:FindFirstChild("SystemCoreMonster") then
+    Workspace.SystemCoreMonster:Destroy()
+end
+
+local function destroyOld(parent, name)
+    pcall(function()
+        local old = parent:FindFirstChild(name)
+        if old then
+            old:Destroy()
+        end
+    end)
+end
+
+destroyOld(CoreGui, "SystemCoreFX")
+destroyOld(playerGui, "SystemCoreFXOverlay")
+destroyOld(CoreGui, "SystemCoreFXOverlay")
+destroyOld(Workspace, "SystemCoreWorldFX")
+destroyOld(SoundService, "CustomAudio")
+destroyOld(SoundService, "SystemCoreAudio")
+destroyOld(Lighting, "SystemCoreColorCorrection")
+destroyOld(Lighting, "SystemCoreAtmosphere")
+
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local quality = isMobile and 0.6 or 1
+
+local SCALE = 2.2
+local FEET_DROP = 100
+local MONSTER_MIN_DISTANCE = 550
+local MONSTER_MAX_DISTANCE = 850
+local FLOOR_COLOR_SPEED = 2.5
+local FLOOR_BUDGET_PER_FRAME = math.floor(160 * quality)
+local LIGHTING_RAMP_TIME = 6
+local SHOCKWAVE_SIZE = 1700
+local DIRECTOR_MIN_GAP = 7
+local DIRECTOR_MAX_GAP = 15
+
+local SOUND_IDS = {
+    Drone = "",
+    Wind = "",
+    Rumble = "",
+    Roar = "",
+    Thump = "",
+    Zap = "",
+    Glint = "",
+}
+
+local session = 0
+local connections = {}
+
+local function track(conn)
+    table.insert(connections, conn)
+    return conn
+end
+
+local function rand(a, b)
+    return a + math.random() * (b - a)
+end
+
+local clamp = math.clamp
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local pulses = {}
+
+local function startPulse(name, peak, attack, duration)
+    pulses[name] = {
+        peak = peak,
+        t0 = os.clock(),
+        a = math.max(attack, 0.01),
+        d = math.max(duration, 0.01)
+    }
+end
+
+local function samplePulse(name, now)
+    local p = pulses[name]
+    if not p then
+        return 0
+    end
+    local e = (now or os.clock()) - p.t0
+    if e >= p.a + p.d then
+        pulses[name] = nil
+        return 0
+    end
+    if e < p.a then
+        return p.peak * (e / p.a)
+    end
+    local k = 1 - (e - p.a) / p.d
+    return p.peak * k * k
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "SystemCoreFX"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+pcall(function()
+    screenGui.Parent = CoreGui
+end)
+
+if not screenGui.Parent then
+    screenGui.Parent = playerGui
+end
+
+local sound = Instance.new("Sound")
+sound.Name = "CustomAudio"
+sound.Looped = true
+sound.Volume = 10
+sound.Parent = SoundService
+
+local audioFolder = Instance.new("Folder")
+audioFolder.Name = "SystemCoreAudio"
+audioFolder.Parent = SoundService
+
+local layerSounds = {}
+local audioAssetId = nil
+
+local function addEq(s, low, mid, high)
+    local eq = Instance.new("EqualizerSoundEffect")
+    eq.LowGain = low
+    eq.MidGain = mid
+    eq.HighGain = high
+    eq.Parent = s
+end
+
+local function addReverb(s, decay, wet)
+    local r = Instance.new("ReverbSoundEffect")
+    r.DecayTime = decay
+    r.WetLevel = wet
+    r.Parent = s
+end
+
+local function addDistortion(s, level)
+    local d = Instance.new("DistortionSoundEffect")
+    d.Level = level
+    d.Parent = s
+end
+
+local function applyAudioSource(s)
+    if audioAssetId and not s:GetAttribute("OwnAsset") then
+        s.SoundId = audioAssetId
+    end
+end
+
+local function newLayerSound(name, speed, volume, looped, parent)
+    local s = Instance.new("Sound")
+    s.Name = name
+    s.Looped = looped
+    s.Volume = volume
+    s.PlaybackSpeed = speed
+    local id = SOUND_IDS[name]
+    if id and id ~= "" then
+        s.SoundId = id
+        s:SetAttribute("OwnAsset", true)
+    end
+    s.Parent = parent
+    return s
+end
+
+local function applyLayerAudio()
+    for _, s in pairs(layerSounds) do
+        applyAudioSource(s)
+    end
+end
+
+layerSounds.Drone = newLayerSound("Drone", 0.42, 0, true, audioFolder)
+addEq(layerSounds.Drone, 6, -25, -60)
+addReverb(layerSounds.Drone, 6, -6)
+
+layerSounds.Wind = newLayerSound("Wind", 1.1, 0, true, audioFolder)
+addEq(layerSounds.Wind, -50, -8, 6)
+addReverb(layerSounds.Wind, 4, -8)
+
+layerSounds.Rumble = newLayerSound("Rumble", 0.2, 0, true, audioFolder)
+addEq(layerSounds.Rumble, 8, -40, -80)
+
+layerSounds.Thump = newLayerSound("Thump", 0.22, 1.8, false, audioFolder)
+addEq(layerSounds.Thump, 8, -30, -70)
+addReverb(layerSounds.Thump, 3, -6)
+
+layerSounds.Zap = newLayerSound("Zap", 2.2, 0.5, false, audioFolder)
+addDistortion(layerSounds.Zap, 0.4)
+
+layerSounds.Glint = newLayerSound("Glint", 1.4, 0.5, false, audioFolder)
+addReverb(layerSounds.Glint, 3, -4)
+
+task.spawn(function()
+    pcall(function()
+        local req = (syn and syn.request) or (http and http.request) or http_request or request
+        if req then
+            local res = req({
+                Url = "https://github.com/objwghd-maker/song/raw/refs/heads/main/video_20260929_200636.mp3",
+                Method = "GET"
+            })
+
+            if res and res.Body then
+                local filePath = "custom_audio_" .. tick() .. ".mp3"
+                writefile(filePath, res.Body)
+                audioAssetId = getcustomasset(filePath)
+                sound.SoundId = audioAssetId
+                applyLayerAudio()
+                pcall(function()
+                    sound:Load()
+                end)
+            end
+        end
+    end)
+end)
+
+local function playSegment(snd, dur, speed, volume)
+    if not snd or not snd.Parent then
+        return
+    end
+
+    local token = (snd:GetAttribute("Token") or 0) + 1
+    snd:SetAttribute("Token", token)
+
+    pcall(function()
+        snd.PlaybackSpeed = speed or 1
+        if volume then
+            snd.Volume = volume
+        end
+        if not snd:GetAttribute("OwnAsset") and snd.TimeLength > 1 then
+            snd.TimePosition = math.random() * math.max(0, snd.TimeLength - dur * (speed or 1) - 0.5)
+        else
+            snd.TimePosition = 0
+        end
+        snd:Play()
+    end)
+
+    local s = session
+    task.delay(math.max(0.2, dur - 0.3), function()
+        if s ~= session or not snd.Parent or snd:GetAttribute("Token") ~= token then
+            return
+        end
+        TweenService:Create(snd, TweenInfo.new(0.3), {Volume = 0}):Play()
+        task.delay(0.35, function()
+            if snd.Parent and snd:GetAttribute("Token") == token then
+                snd:Stop()
+            end
+        end)
+    end)
+end
+
+local toggleButton = Instance.new("TextButton")
+toggleButton.Name = "ToggleButton"
+toggleButton.Size = UDim2.new(0, 120, 0, 120)
+toggleButton.Position = UDim2.new(0, 20, 0, 20)
+toggleButton.BackgroundTransparency = 1
+toggleButton.Text = "▲"
+toggleButton.TextScaled = true
+toggleButton.Font = Enum.Font.GothamBlack
+toggleButton.TextColor3 = Color3.fromRGB(255, 220, 0)
+toggleButton.AutoButtonColor = false
+toggleButton.ZIndex = 10
+toggleButton.Parent = screenGui
+
+local buttonStroke = Instance.new("UIStroke")
+buttonStroke.Color = Color3.fromRGB(255, 180, 0)
+buttonStroke.Thickness = 3
+buttonStroke.Parent = toggleButton
+
+local dragging = false
+local dragStart
+local startPos
+local dragMoved = false
+
+toggleButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragMoved = false
+        dragStart = input.Position
+        startPos = toggleButton.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+
+        if delta.Magnitude > 10 then
+            dragMoved = true
+        end
+
+        toggleButton.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end))
+
+local isActive = false
+local floorParts = {}
+local originalColors = {}
+local originalCFrames = {}
+local floorCursor = 1
+
+local monster
+local monsterParts = {}
+local monsterBaseCFrames = {}
+local monsterLight
+local monsterHighlight
+
+local monsterWorldPosition
+local earthquakeStrength = 0.18
+local earthquakeSpeed = 18
+
+local monsterGroundPosition
+local monsterCurrentGround
+local monsterFacing = CFrame.new()
+local monsterBaseRoot = CFrame.new()
+local monsterSpawnDistance = 0
+local monsterApproachMax = 0
+local approachDir = Vector3.new(0, 0, 1)
+local monsterRel = {}
+local monsterGroup = {}
+local monsterEyes = {}
+local monsterMouthGlow
+local monsterGlow = {}
+local monsterShadow
+local monsterFogPart
+local monsterFogEmitter
+local roarSound
+local nextBlinkTime = 0
+local glowFrameCounter = 0
+local groupCF = {
+    body = CFrame.new(),
+    head = CFrame.new(),
+    jaw = CFrame.new(),
+    armL = CFrame.new(),
+    armR = CFrame.new()
+}
+
+local fxFolder
+local emitterParts = {}
+local emitters = {}
+
+local overlayGui
+local overlayFrame
+local vignetteEdges = {}
+local bloodFrames = {}
+
+local lightingActive = false
+local atmosphereLevel = 0
+local colorCorrection
+local atmosphereObj
+local atmosphereCreated = false
+local originalAtmosphere = {}
+
+local originalLighting = {
+    Brightness = Lighting.Brightness,
+    Ambient = Lighting.Ambient,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+    ColorShift_Top = Lighting.ColorShift_Top,
+    ColorShift_Bottom = Lighting.ColorShift_Bottom,
+    FogColor = Lighting.FogColor,
+    FogStart = Lighting.FogStart,
+    FogEnd = Lighting.FogEnd,
+    ExposureCompensation = Lighting.ExposureCompensation
+}
+
+local function createPart(parent, name, size, color, material, transparency)
+    local part = Instance.new("Part")
+    part.Name = name
+    part.Size = size
+    part.Color = color
+    part.Material = material or Enum.Material.Neon
+    part.Transparency = transparency or 0
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.CastShadow = true
+    part.Parent = parent
+    return part
+end
+
+local function newInvisiblePart(name, size)
+    local p = createPart(fxFolder, name, size, Color3.fromRGB(0, 0, 0), Enum.Material.SmoothPlastic, 1)
+    p.CastShadow = false
+    return p
+end
+
+local function createGlow(adornee, name, studs, bases, color, alwaysOnTop)
+    local gui = Instance.new("BillboardGui")
+    gui.Name = name
+    gui.Adornee = adornee
+    gui.Size = UDim2.new(studs, 0, studs, 0)
+    gui.AlwaysOnTop = alwaysOnTop
+    gui.LightInfluence = 0
+    gui.Active = false
+    gui.Parent = adornee
+
+    local frames = {}
+    local ratios = {1, 0.62, 0.36, 0.16}
+
+    for i, base in ipairs(bases) do
+        local f = Instance.new("Frame")
+        f.AnchorPoint = Vector2.new(0.5, 0.5)
+        f.Position = UDim2.fromScale(0.5, 0.5)
+        local r = ratios[i] or 0.1
+        f.Size = UDim2.fromScale(r, r)
+        f.BackgroundColor3 = color
+        f.BackgroundTransparency = base
+        f.BorderSizePixel = 0
+        f.Parent = gui
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(1, 0)
+        c.Parent = f
+
+        frames[i] = f
+    end
+
+    return {gui = gui, frames = frames, base = bases}
+end
+
+local function toRel(cf)
+    local p = cf.Position
+    return CFrame.new(p * SCALE) * (CFrame.new(-p) * cf)
+end
+
+local function addMonsterPart(model, name, size, relCF, color, material, group)
+    local part = createPart(model, name, size * SCALE, color, material or Enum.Material.Neon)
+    part.CastShadow = false
+    local rel = toRel(relCF)
+    monsterRel[part] = rel
+    monsterGroup[part] = group or "body"
+    table.insert(monsterParts, part)
+    monsterBaseCFrames[part] = monsterBaseRoot * rel
+    part.CFrame = monsterBaseRoot * rel
+    return part
+end
+
+local function addMonsterLimb(model, name, thick, depth, len, startCF, jointRot, color, group)
+    local cf = startCF * jointRot
+    addMonsterPart(model, name, Vector3.new(thick, len, depth), cf * CFrame.new(0, -len / 2, 0), color, Enum.Material.Neon, group)
+    return cf * CFrame.new(0, -len, 0)
+end
+
+local function getRandomMonsterPosition()
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+
+    if not root then
+        local g = Vector3.new(0, 5, 0)
+        return g + Vector3.new(0, FEET_DROP * SCALE, 0), g
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = {character}
+    if fxFolder then
+        table.insert(filter, fxFolder)
+    end
+    rayParams.FilterDescendantsInstances = filter
+
+    local ground
+    local fallbackGround
+
+    for _ = 1, 6 do
+        local angle = math.random() * math.pi * 2
+        local distance = math.random(MONSTER_MIN_DISTANCE, MONSTER_MAX_DISTANCE)
+
+        local x = math.cos(angle) * distance
+        local z = math.sin(angle) * distance
+
+        local rayOrigin = root.Position + Vector3.new(x, 600, z)
+        local rayDirection = Vector3.new(0, -1200, 0)
+
+        local result = Workspace:Raycast(rayOrigin, rayDirection, rayParams)
+
+        if result then
+            ground = result.Position
+            break
+        end
+
+        if not fallbackGround then
+            fallbackGround = Vector3.new(root.Position.X + x, root.Position.Y - 3, root.Position.Z + z)
+        end
+    end
+
+    ground = ground or fallbackGround
+    return ground + Vector3.new(0, FEET_DROP * SCALE, 0), ground
+end
+
+local function createMonsterFog()
+    if not fxFolder or not monsterCurrentGround then
+        return
+    end
+
+    monsterFogPart = newInvisiblePart("MonsterFogEmitter", Vector3.new(340, 30, 340))
+    monsterFogPart.CFrame = CFrame.new(monsterCurrentGround + Vector3.new(0, 12, 0))
+
+    local e = Instance.new("ParticleEmitter")
+    e.Name = "MonsterFog"
+    e.Texture = "rbxasset://textures/particles/smoke_main.dds"
+    e.Color = ColorSequence.new(Color3.fromRGB(95, 0, 0))
+    e.Size = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 120),
+        NumberSequenceKeypoint.new(1, 220)
+    })
+    e.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.3, 0.8),
+        NumberSequenceKeypoint.new(0.7, 0.88),
+        NumberSequenceKeypoint.new(1, 1)
+    })
+    e.Lifetime = NumberRange.new(14, 20)
+    e.Speed = NumberRange.new(0.5, 2)
+    e.Rate = 0
+    e.LightEmission = 0.3
+    e.LightInfluence = 0
+    e.RotSpeed = NumberRange.new(-6, 6)
+    e.Rotation = NumberRange.new(0, 360)
+    e.EmissionDirection = Enum.NormalId.Top
+    e.Acceleration = Vector3.new(1, 0.2, 0.5)
+    e.Parent = monsterFogPart
+    monsterFogEmitter = e
+end
+
+local function createMonster()
+    if Workspace:FindFirstChild("SystemCoreMonster") then
+        Workspace.SystemCoreMonster:Destroy()
+    end
+
+    monsterParts = {}
+    monsterBaseCFrames = {}
+    monsterRel = {}
+    monsterGroup = {}
+    monsterEyes = {}
+    monsterGlow = {}
+    monsterMouthGlow = nil
+
+    monsterWorldPosition, monsterGroundPosition = getRandomMonsterPosition()
+    monsterCurrentGround = monsterGroundPosition
+
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local flatDir = Vector3.new(0, 0, -1)
+    monsterSpawnDistance = 0
+
+    if root then
+        local d = Vector3.new(root.Position.X - monsterWorldPosition.X, 0, root.Position.Z - monsterWorldPosition.Z)
+        if d.Magnitude > 1 then
+            flatDir = d
+            approachDir = d.Unit
+            monsterSpawnDistance = d.Magnitude
+        end
+    end
+
+    monsterFacing = CFrame.lookAt(Vector3.new(0, 0, 0), flatDir) * CFrame.Angles(0, math.rad(math.random(-8, 8)), 0)
+    monsterApproachMax = math.max(0, monsterSpawnDistance - 340) * 0.5
+    monsterBaseRoot = CFrame.new(monsterWorldPosition) * monsterFacing
+
+    local model = Instance.new("Model")
+    model.Name = "SystemCoreMonster"
+    model.Parent = Workspace
+
+    addMonsterPart(model, "MonsterBody", Vector3.new(14, 10, 9), CFrame.new(0, 3, 0), Color3.fromRGB(90, 0, 0))
+    addMonsterPart(model, "MonsterTorso", Vector3.new(11, 52, 7), CFrame.new(0, 36, 0), Color3.fromRGB(80, 0, 0))
+    addMonsterPart(model, "MonsterChest", Vector3.new(20, 30, 10), CFrame.new(0, 52, -0.5), Color3.fromRGB(115, 0, 0))
+    addMonsterPart(model, "MonsterShoulders", Vector3.new(34, 6, 8), CFrame.new(0, 66, 0), Color3.fromRGB(100, 0, 0))
+
+    for i, y in ipairs({44, 50, 56}) do
+        addMonsterPart(model, "Rib" .. i, Vector3.new(22, 1.2, 11), CFrame.new(0, y, -0.5), Color3.fromRGB(40, 0, 0))
+    end
+
+    addMonsterPart(model, "MonsterNeck", Vector3.new(5, 18, 5), CFrame.new(0, 77, -1) * CFrame.Angles(math.rad(-12), 0, 0), Color3.fromRGB(105, 0, 0))
+
+    local head = addMonsterPart(model, "MonsterHead", Vector3.new(13, 24, 13), CFrame.new(0, 99, -4), Color3.fromRGB(145, 0, 0), Enum.Material.Neon, "head")
+    addMonsterPart(model, "Brow", Vector3.new(15, 3, 4), CFrame.new(0, 106, -10.2), Color3.fromRGB(45, 0, 0), Enum.Material.Neon, "head")
+
+    for _, s in ipairs({-1, 1}) do
+        local side = s == -1 and "Left" or "Right"
+
+        addMonsterPart(model, side .. "Socket", Vector3.new(7, 5.5, 1), CFrame.new(s * 3.6, 101, -10.7), Color3.fromRGB(10, 0, 0), Enum.Material.Neon, "head")
+
+        local eye = addMonsterPart(model, side .. "Eye", Vector3.new(4.2, 2.4, 1.4), CFrame.new(s * 3.6, 101, -11.4) * CFrame.Angles(0, 0, s * math.rad(18)), Color3.fromRGB(255, 0, 0), Enum.Material.Neon, "head")
+        table.insert(monsterEyes, eye)
+        table.insert(monsterGlow, createGlow(eye, "EyeGlow", 40, {0.93, 0.84, 0.62, 0.28}, Color3.fromRGB(255, 20, 20), true))
+        monsterGlow[#monsterGlow].kind = "eye"
+    end
+
+    monsterMouthGlow = addMonsterPart(model, "MonsterMouth", Vector3.new(9, 2.2, 1), CFrame.new(0, 88.6, -10.8), Color3.fromRGB(255, 0, 0), Enum.Material.Neon, "head")
+    addMonsterPart(model, "MouthInside", Vector3.new(8, 5, 6), CFrame.new(0, 86.5, -7.5), Color3.fromRGB(120, 0, 0), Enum.Material.Neon, "head")
+    addMonsterPart(model, "MonsterJaw", Vector3.new(10, 6, 9), CFrame.new(0, 84, -6), Color3.fromRGB(110, 0, 0), Enum.Material.Neon, "jaw")
+
+    for i, x in ipairs({-3.2, -1.1, 1.1, 3.2}) do
+        addMonsterPart(model, "UpperTooth" .. i, Vector3.new(0.9, 3.4, 0.9), CFrame.new(x, 88, -10.4), Color3.fromRGB(170, 150, 130), Enum.Material.SmoothPlastic, "head")
+        addMonsterPart(model, "LowerTooth" .. i, Vector3.new(0.9, 3, 0.9), CFrame.new(x * 0.9, 88.5, -9.2), Color3.fromRGB(170, 150, 130), Enum.Material.SmoothPlastic, "jaw")
+    end
+
+    for _, s in ipairs({-1, 1}) do
+        local side = s == -1 and "Left" or "Right"
+        addMonsterPart(model, side .. "Horn", Vector3.new(3.4, 14, 3.4), CFrame.new(s * 6.5, 116.5, -2) * CFrame.Angles(0, 0, -s * math.rad(20)), Color3.fromRGB(75, 0, 0), Enum.Material.Neon, "head")
+        addMonsterPart(model, side .. "HornTip", Vector3.new(2.4, 12, 2.4), CFrame.new(s * 12.4, 127.6, -2) * CFrame.Angles(0, 0, -s * math.rad(38)), Color3.fromRGB(60, 0, 0), Enum.Material.Neon, "head")
+    end
+
+    for _, s in ipairs({-1, 1}) do
+        local side = s == -1 and "Left" or "Right"
+        local group = s == -1 and "armL" or "armR"
+        local shoulderCF = CFrame.new(s * 13, 66, 0)
+
+        local upperEnd = addMonsterLimb(model, side .. "Arm", 5, 5, 46, shoulderCF, CFrame.Angles(math.rad(-4), 0, s * math.rad(8)), Color3.fromRGB(75, 0, 0), group)
+        local foreEnd = addMonsterLimb(model, side .. "Forearm", 4, 4, 52, upperEnd, CFrame.Angles(math.rad(-12), 0, -s * math.rad(7)), Color3.fromRGB(85, 0, 0), group)
+        local handEnd = addMonsterLimb(model, side .. "Hand", 7, 4, 12, foreEnd, CFrame.new(), Color3.fromRGB(95, 0, 0), group)
+
+        local lens = {16, 21, 16}
+        local xs = {-2.4, 0, 2.4}
+        for i = 1, 3 do
+            addMonsterLimb(model, side .. "Finger" .. i, 1.4, 1.4, lens[i], handEnd * CFrame.new(xs[i], 0, 0), CFrame.Angles(math.rad(-8 - i * 3), 0, xs[i] * 0.1), Color3.fromRGB(70, 0, 0), group)
+        end
+    end
+
+    for _, s in ipairs({-1, 1}) do
+        local side = s == -1 and "Left" or "Right"
+        local hipCF = CFrame.new(s * 5, 0, 0)
+
+        local thighEnd = addMonsterLimb(model, side .. "Thigh", 6, 6, 48, hipCF, CFrame.Angles(0, 0, s * math.rad(2)), Color3.fromRGB(65, 0, 0), "body")
+        local shinEnd = addMonsterLimb(model, side .. "Leg", 5, 5, 50, thighEnd, CFrame.Angles(math.rad(6), 0, -s * math.rad(2)), Color3.fromRGB(60, 0, 0), "body")
+        addMonsterPart(model, side .. "Foot", Vector3.new(8, 3, 14), shinEnd * CFrame.new(0, -1.5, -4), Color3.fromRGB(55, 0, 0), Enum.Material.Neon, "body")
+    end
+
+    table.insert(monsterGlow, createGlow(head, "HeadGlow", 300, {0.94, 0.9, 0.82, 0.7}, Color3.fromRGB(255, 0, 0), false))
+    monsterGlow[#monsterGlow].kind = "aura"
+
+    local torso = model:FindFirstChild("MonsterChest")
+    if torso then
+        table.insert(monsterGlow, createGlow(torso, "BodyAura", 700, {0.975, 0.955, 0.93}, Color3.fromRGB(200, 0, 0), false))
+        monsterGlow[#monsterGlow].kind = "aura"
+    end
+
+    monsterLight = Instance.new("PointLight")
+    monsterLight.Name = "RedMonsterLight"
+    monsterLight.Color = Color3.fromRGB(255, 0, 0)
+    monsterLight.Brightness = 18
+    monsterLight.Range = 150
+    monsterLight.Shadows = not isMobile
+    monsterLight.Parent = head
+
+    monsterHighlight = Instance.new("Highlight")
+    monsterHighlight.Name = "MonsterHighlight"
+    monsterHighlight.FillColor = Color3.fromRGB(255, 0, 0)
+    monsterHighlight.OutlineColor = Color3.fromRGB(255, 0, 0)
+    monsterHighlight.FillTransparency = 0.8
+    monsterHighlight.OutlineTransparency = 0.35
+    monsterHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    monsterHighlight.Parent = model
+
+    roarSound = newLayerSound("Roar", 0.28, 3.5, false, head)
+    roarSound.RollOffMode = Enum.RollOffMode.InverseTapered
+    roarSound.RollOffMinDistance = 300
+    roarSound.RollOffMaxDistance = 4000
+    addEq(roarSound, 8, -20, -45)
+    addDistortion(roarSound, 0.3)
+    addReverb(roarSound, 6, -4)
+    applyAudioSource(roarSound)
+
+    if fxFolder then
+        monsterShadow = createPart(fxFolder, "MonsterShadow", Vector3.new(0.4, 230, 140), Color3.fromRGB(0, 0, 0), Enum.Material.SmoothPlastic, 0.55)
+        monsterShadow.Shape = Enum.PartType.Cylinder
+        monsterShadow.CastShadow = false
+        monsterShadow.CFrame = CFrame.new(monsterGroundPosition + Vector3.new(0, 0.4, 0)) * monsterFacing * CFrame.Angles(0, 0, math.rad(90))
+    end
+
+    createMonsterFog()
+
+    monster = model
+end
+
+local function destroyMonster()
+    monsterParts = {}
+    monsterBaseCFrames = {}
+    monsterRel = {}
+    monsterGroup = {}
+    monsterEyes = {}
+    monsterGlow = {}
+    monsterMouthGlow = nil
+    monsterWorldPosition = nil
+    monsterGroundPosition = nil
+    monsterCurrentGround = nil
+    monsterShadow = nil
+    monsterFogPart = nil
+    monsterFogEmitter = nil
+    roarSound = nil
+
+    if monster then
+        monster:Destroy()
+        monster = nil
+    end
+
+    monsterLight = nil
+    monsterHighlight = nil
+end
+
+local function makeEmitter(parent, props)
+    local e = Instance.new("ParticleEmitter")
+    for k, v in pairs(props) do
+        e[k] = v
+    end
+    e.Rate = 0
+    e.Parent = parent
+    return e
+end
+
+local function createWorldFX()
+    if fxFolder then
+        fxFolder:Destroy()
+    end
+
+    fxFolder = Instance.new("Folder")
+    fxFolder.Name = "SystemCoreWorldFX"
+    fxFolder.Parent = Workspace
+
+    emitterParts.ash = newInvisiblePart("AshEmitter", Vector3.new(160, 2, 160))
+    emitterParts.ember = newInvisiblePart("EmberEmitter", Vector3.new(140, 2, 140))
+    emitterParts.smoke = newInvisiblePart("SmokeEmitter", Vector3.new(170, 2, 170))
+
+    emitters.ash = makeEmitter(emitterParts.ash, {
+        Name = "Ash",
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(18, 10, 10)),
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 0.7)}),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.15, 0.35),
+            NumberSequenceKeypoint.new(0.85, 0.5),
+            NumberSequenceKeypoint.new(1, 1)
+        }),
+        Lifetime = NumberRange.new(14, 20),
+        Speed = NumberRange.new(0.5, 2),
+        EmissionDirection = Enum.NormalId.Bottom,
+        SpreadAngle = Vector2.new(30, 30),
+        Acceleration = Vector3.new(2, -1.2, 1),
+        Drag = 0.6,
+        RotSpeed = NumberRange.new(-20, 20),
+        Rotation = NumberRange.new(0, 360),
+        LightEmission = 0,
+        LightInfluence = 0.3
+    })
+
+    emitters.embers = makeEmitter(emitterParts.ember, {
+        Name = "Embers",
+        Color = ColorSequence.new(Color3.fromRGB(255, 70, 0), Color3.fromRGB(120, 0, 0)),
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 0.1)}),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.2),
+            NumberSequenceKeypoint.new(0.7, 0.4),
+            NumberSequenceKeypoint.new(1, 1)
+        }),
+        Lifetime = NumberRange.new(5, 9),
+        Speed = NumberRange.new(1, 4),
+        EmissionDirection = Enum.NormalId.Top,
+        SpreadAngle = Vector2.new(25, 25),
+        Acceleration = Vector3.new(1, 3, 0.5),
+        Drag = 0.3,
+        LightEmission = 1,
+        LightInfluence = 0
+    })
+
+    emitters.smoke = makeEmitter(emitterParts.smoke, {
+        Name = "GroundSmoke",
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(25, 4, 4)),
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 25), NumberSequenceKeypoint.new(1, 60)}),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.25, 0.82),
+            NumberSequenceKeypoint.new(0.7, 0.9),
+            NumberSequenceKeypoint.new(1, 1)
+        }),
+        Lifetime = NumberRange.new(10, 14),
+        Speed = NumberRange.new(1, 3),
+        EmissionDirection = Enum.NormalId.Top,
+        Acceleration = Vector3.new(1, 0.3, 0.4),
+        RotSpeed = NumberRange.new(-8, 8),
+        Rotation = NumberRange.new(0, 360),
+        LightEmission = 0,
+        LightInfluence = 0.5
+    })
+end
+
+local function destroyWorldFX()
+    if fxFolder then
+        fxFolder:Destroy()
+        fxFolder = nil
+    end
+    emitterParts = {}
+    emitters = {}
+    monsterShadow = nil
+    monsterFogPart = nil
+    monsterFogEmitter = nil
+end
+
+local function followCamera()
+    local camera = Workspace.CurrentCamera
+    if not camera or not fxFolder then
+        return
+    end
+
+    local camPos = camera.CFrame.Position
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local groundY = root and (root.Position.Y - 3) or (camPos.Y - 5)
+
+    if emitterParts.ash then
+        emitterParts.ash.CFrame = CFrame.new(camPos.X, camPos.Y + 45, camPos.Z)
+    end
+    if emitterParts.ember then
+        emitterParts.ember.CFrame = CFrame.new(camPos.X, groundY + 1, camPos.Z)
+    end
+    if emitterParts.smoke then
+        emitterParts.smoke.CFrame = CFrame.new(camPos.X, groundY + 2, camPos.Z)
+    end
+end
+
+local function updateParticles(now)
+    if not fxFolder then
+        return
+    end
+
+    local lvl = atmosphereLevel
+    local fogThick = samplePulse("fogThick", now)
+    local flash = samplePulse("redFlash", now)
+    local reveal = samplePulse("reveal", now)
+    local smokeWave = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(now * 0.35))
+
+    if emitters.ash then
+        emitters.ash.Rate = 10 * quality * lvl
+    end
+    if emitters.embers then
+        emitters.embers.Rate = (5 + 6 * flash) * quality * lvl
+    end
+    if emitters.smoke then
+        emitters.smoke.Rate = 1.8 * quality * lvl * smokeWave * (1 + fogThick)
+    end
+    if monsterFogEmitter then
+        monsterFogEmitter.Rate = (2.5 + 3 * fogThick + 2 * reveal) * quality * lvl
+    end
+end
+
+local function spawnShockwave()
+    if not (fxFolder and fxFolder.Parent and monsterCurrentGround) then
+        return
+    end
+
+    local ring = createPart(fxFolder, "Shockwave", Vector3.new(40, 0.4, 40), Color3.fromRGB(255, 0, 0), Enum.Material.SmoothPlastic, 1)
+    ring.CastShadow = false
+    ring.CFrame = CFrame.new(monsterCurrentGround + Vector3.new(0, 1.5, 0))
+
+    local sg = Instance.new("SurfaceGui")
+    sg.Face = Enum.NormalId.Top
+    sg.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+    sg.CanvasSize = Vector2.new(1024, 1024)
+    sg.AlwaysOnTop = false
+    sg.LightInfluence = 0
+    pcall(function()
+        sg.Brightness = 2
+    end)
+    pcall(function()
+        sg.MaxDistance = 10000
+    end)
+    sg.Parent = ring
+
+    local circle = Instance.new("Frame")
+    circle.Size = UDim2.fromScale(1, 1)
+    circle.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+    circle.BackgroundTransparency = 0.9
+    circle.BorderSizePixel = 0
+    circle.Parent = sg
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = circle
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 0, 0)
+    stroke.Thickness = 26
+    stroke.Transparency = 0.1
+    stroke.Parent = circle
+
+    local duration = 4.5
+    TweenService:Create(ring, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = Vector3.new(SHOCKWAVE_SIZE, 0.4, SHOCKWAVE_SIZE)
+    }):Play()
+    TweenService:Create(stroke, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Transparency = 1}):Play()
+    TweenService:Create(circle, TweenInfo.new(duration, Enum.EasingStyle.Linear), {BackgroundTransparency = 1}):Play()
+
+    Debris:AddItem(ring, duration + 0.3)
+end
+
+local function destroyOverlayFX()
+    if overlayGui then
+        overlayGui:Destroy()
+    end
+    overlayGui = nil
+    overlayFrame = nil
+    vignetteEdges = {}
+    bloodFrames = {}
+end
+
+local function createOverlayFX()
+    destroyOverlayFX()
+
+    overlayGui = Instance.new("ScreenGui")
+    overlayGui.Name = "SystemCoreFXOverlay"
+    overlayGui.ResetOnSpawn = false
+    overlayGui.IgnoreGuiInset = true
+    overlayGui.DisplayOrder = -10
+    overlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    pcall(function()
+        overlayGui.Parent = CoreGui
+    end)
+
+    if not overlayGui.Parent then
+        overlayGui.Parent = playerGui
+    end
+
+    local function passThrough(f)
+        f.Active = false
+        pcall(function()
+            f.Interactable = false
+        end)
+    end
+
+    overlayFrame = Instance.new("Frame")
+    overlayFrame.Name = "DarkOverlay"
+    overlayFrame.Size = UDim2.fromScale(1, 1)
+    overlayFrame.BackgroundColor3 = Color3.fromRGB(12, 0, 0)
+    overlayFrame.BackgroundTransparency = 1
+    overlayFrame.BorderSizePixel = 0
+    overlayFrame.Visible = false
+    overlayFrame.ZIndex = 1
+    passThrough(overlayFrame)
+    overlayFrame.Parent = overlayGui
+
+    local function makeEdge(name, pos, size, rotation)
+        local f = Instance.new("Frame")
+        f.Name = name
+        f.Position = pos
+        f.Size = size
+        f.BackgroundColor3 = Color3.fromRGB(8, 0, 0)
+        f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.ZIndex = 2
+        passThrough(f)
+
+        local g = Instance.new("UIGradient")
+        g.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1)
+        })
+        g.Rotation = rotation
+        g.Parent = f
+
+        f.Parent = overlayGui
+        table.insert(vignetteEdges, f)
+    end
+
+    makeEdge("VignetteTop", UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0.28, 0), 90)
+    makeEdge("VignetteBottom", UDim2.new(0, 0, 0.72, 0), UDim2.new(1, 0, 0.28, 0), -90)
+    makeEdge("VignetteLeft", UDim2.new(0, 0, 0, 0), UDim2.new(0.2, 0, 1, 0), 0)
+    makeEdge("VignetteRight", UDim2.new(0.8, 0, 0, 0), UDim2.new(0.2, 0, 1, 0), 180)
+
+    for i = 1, 5 do
+        local f = Instance.new("Frame")
+        f.Name = "BloodTrace" .. i
+        f.BackgroundColor3 = Color3.fromRGB(170, 0, 0)
+        f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.Size = UDim2.new(0.004, 0, 0.1, 0)
+        f.ZIndex = 3
+        passThrough(f)
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(1, 0)
+        c.Parent = f
+
+        f.Parent = overlayGui
+        table.insert(bloodFrames, f)
+    end
+end
+
+local function bloodTrace(count)
+    if #bloodFrames == 0 then
+        return
+    end
+
+    local s = session
+    for _ = 1, (count or 2) do
+        local f = bloodFrames[math.random(#bloodFrames)]
+        local h = rand(0.12, 0.3)
+        local w = rand(0.003, 0.007)
+
+        f.AnchorPoint = Vector2.new(0, 0)
+        f.Position = UDim2.new(rand(0.05, 0.95), 0, rand(-0.05, 0.35), 0)
+        f.Rotation = rand(-18, 18)
+        f.Size = UDim2.new(w, 0, h * 0.25, 0)
+        f.BackgroundTransparency = 1
+
+        local tIn = TweenService:Create(f, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            BackgroundTransparency = 0.45,
+            Size = UDim2.new(w, 0, h, 0)
+        })
+        tIn.Completed:Connect(function()
+            if s ~= session or not f.Parent then
+                return
+            end
+            TweenService:Create(f, TweenInfo.new(rand(2, 3.5), Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+                BackgroundTransparency = 1
+            }):Play()
+        end)
+        tIn:Play()
+    end
+end
+
+local function updateOverlay(now)
+    if not overlayGui then
+        return
+    end
+
+    local flash = samplePulse("redFlash", now)
+    local ov = math.min(0.4, samplePulse("overlay", now))
+
+    overlayFrame.BackgroundColor3 = Color3.fromRGB(12 + 70 * math.min(flash, 1), 0, 0)
+    overlayFrame.BackgroundTransparency = 1 - ov
+    overlayFrame.Visible = ov > 0.004
+
+    local v = math.min(0.65, 0.1 * atmosphereLevel + samplePulse("vignette", now) + 0.08 * samplePulse("quake", now))
+    local edgeColor = Color3.fromRGB(8 + 40 * math.min(flash, 1), 0, 0)
+
+    for _, e in ipairs(vignetteEdges) do
+        e.BackgroundTransparency = 1 - v
+        e.BackgroundColor3 = edgeColor
+    end
+end
+
+local function isExcludedPart(obj)
+    if obj:IsA("Terrain") then
+        return true
+    end
+
+    if not obj.Anchored then
+        return true
+    end
+
+    if fxFolder and obj:IsDescendantOf(fxFolder) then
+        return true
+    end
+
+    if monster and obj:IsDescendantOf(monster) then
+        return true
+    end
+
+    local a = obj.Parent
+    while a and a ~= Workspace do
+        if a:IsA("Model") and a:FindFirstChildOfClass("Humanoid") then
+            return true
+        end
+        a = a.Parent
+    end
+
+    return false
+end
+
+local function updateFloorList()
+    floorParts = {}
+    originalColors = {}
+    originalCFrames = {}
+    floorCursor = 1
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local size = obj.Size
+            local isHorizontal = size.Y < size.X and size.Y < size.Z
+            local isLargeArea = (size.X >= 10 and size.Z >= 10) or obj.Position.Y < 5
+
+            if (isHorizontal or isLargeArea) and not isExcludedPart(obj) then
+                table.insert(floorParts, obj)
+                originalColors[obj] = obj.Color
+                originalCFrames[obj] = obj.CFrame
+            end
+        end
+    end
+end
+
+local function restoreOriginalState()
+    for _, obj in ipairs(floorParts) do
+        if obj and obj.Parent then
+            if originalColors[obj] then
+                obj.Color = originalColors[obj]
+            end
+
+            if originalCFrames[obj] then
+                obj.CFrame = originalCFrames[obj]
+            end
+        end
+    end
+
+    floorParts = {}
+    originalColors = {}
+    originalCFrames = {}
+end
+
+local function updateButtonColor()
+    if isActive then
+        toggleButton.TextColor3 = Color3.fromRGB(255, 0, 0)
+        buttonStroke.Color = Color3.fromRGB(255, 0, 0)
+    else
+        toggleButton.TextColor3 = Color3.fromRGB(255, 220, 0)
+        buttonStroke.Color = Color3.fromRGB(255, 170, 0)
+    end
+end
+
+local colorSequence = {
+    Color3.fromRGB(35, 0, 0),
+    Color3.fromRGB(90, 0, 0),
+    Color3.fromRGB(150, 0, 0),
+    Color3.fromRGB(255, 0, 0),
+    Color3.fromRGB(75, 0, 0),
+    Color3.fromRGB(6, 0, 0),
+    Color3.fromRGB(220, 10, 10)
+}
+
+local function updateFloor(now)
+    local n = #floorParts
+    if n == 0 then
+        return
+    end
+
+    local seqPos = (now * FLOOR_COLOR_SPEED) % #colorSequence
+    local i0 = math.floor(seqPos)
+    local frac = seqPos - i0
+    local c1 = colorSequence[i0 + 1]
+    local c2 = colorSequence[(i0 + 1) % #colorSequence + 1]
+    local targetColor = c1:Lerp(c2, frac)
+
+    local hot = samplePulse("floorHot", now)
+    if hot > 0 then
+        targetColor = targetColor:Lerp(Color3.fromRGB(255, 0, 0), math.min(hot, 1))
+    end
+
+    local shakePulse = samplePulse("floorShake", now)
+    local jitterMul = 0.35 + shakePulse * 0.65
+    local rippleAmp = 0.15 + shakePulse * 1.2 + hot * 0.5
+
+    local center = monsterCurrentGround
+    local count = math.min(n, FLOOR_BUDGET_PER_FRAME)
+
+    for _ = 1, count do
+        local obj = floorParts[floorCursor]
+        floorCursor = floorCursor % n + 1
+
+        if obj and obj.Parent then
+            obj.Color = targetColor
+
+            local origCF = originalCFrames[obj]
+
+            if origCF then
+                local offsetX = math.random(-350, 350) / 100 * jitterMul
+                local offsetZ = math.random(-350, 350) / 100 * jitterMul
+                local offsetY = math.random(-150, 150) / 100 * jitterMul
+
+                if center then
+                    local p = origCF.Position
+                    local dx = p.X - center.X
+                    local dz = p.Z - center.Z
+                    local dist = math.sqrt(dx * dx + dz * dz)
+                    offsetY = offsetY + math.sin(dist * 0.045 - now * 5) * rippleAmp
+                end
+
+                obj.CFrame = origCF + Vector3.new(
+                    offsetX,
+                    offsetY,
+                    offsetZ
+                )
+            end
+        end
+    end
+end
+
+local function activateLighting()
+    originalLighting = {
+        Brightness = Lighting.Brightness,
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+        ColorShift_Top = Lighting.ColorShift_Top,
+        ColorShift_Bottom = Lighting.ColorShift_Bottom,
+        FogColor = Lighting.FogColor,
+        FogStart = Lighting.FogStart,
+        FogEnd = Lighting.FogEnd,
+        ExposureCompensation = Lighting.ExposureCompensation
+    }
+
+    atmosphereObj = Lighting:FindFirstChildOfClass("Atmosphere")
+    atmosphereCreated = false
+
+    if atmosphereObj then
+        originalAtmosphere = {
+            Density = atmosphereObj.Density,
+            Offset = atmosphereObj.Offset,
+            Color = atmosphereObj.Color,
+            Decay = atmosphereObj.Decay,
+            Glare = atmosphereObj.Glare,
+            Haze = atmosphereObj.Haze
+        }
+    else
+        atmosphereObj = Instance.new("Atmosphere")
+        atmosphereObj.Name = "SystemCoreAtmosphere"
+        atmosphereObj.Density = 0
+        atmosphereObj.Haze = 0
+        atmosphereObj.Glare = 0
+        atmosphereObj.Parent = Lighting
+        atmosphereCreated = true
+        originalAtmosphere = {
+            Density = 0,
+            Offset = 0,
+            Color = Color3.fromRGB(199, 170, 107),
+            Decay = Color3.fromRGB(106, 112, 125),
+            Glare = 0,
+            Haze = 0
+        }
+    end
+
+    colorCorrection = Instance.new("ColorCorrectionEffect")
+    colorCorrection.Name = "SystemCoreColorCorrection"
+    colorCorrection.Parent = Lighting
+
+    atmosphereLevel = 0
+    lightingActive = true
+end
+
+local function updateLighting(now, dt)
+    if not lightingActive then
+        return
+    end
+
+    atmosphereLevel = math.min(1, atmosphereLevel + dt / LIGHTING_RAMP_TIME)
+    local level = atmosphereLevel * atmosphereLevel * (3 - 2 * atmosphereLevel)
+
+    local dim = math.min(samplePulse("blackout", now), 1)
+    local flash = samplePulse("redFlash", now)
+    local fogThick = samplePulse("fogThick", now)
+    local reveal = samplePulse("reveal", now)
+    local roarL = samplePulse("roarLight", now)
+
+    local breathe = 0.5 + 0.5 * math.sin(now * 0.7)
+    local faulty = clamp(math.noise(now * 0.8, 3) * 1.2, -0.3, 0.3)
+    local pulseMul = clamp(0.75 + 0.2 * breathe + faulty, 0.45, 1.05)
+
+    local keep = 1 - 0.85 * dim
+
+    Lighting.Brightness = lerp(originalLighting.Brightness, (0.35 + 0.5 * flash + 0.2 * roarL) * keep, level)
+
+    local amb = Color3.fromRGB(clamp((80 * pulseMul + 140 * flash + 40 * roarL) * keep, 0, 255), 0, 0)
+    local outAmb = Color3.fromRGB(clamp((55 * pulseMul + 100 * flash + 30 * roarL) * keep, 0, 255), 0, 0)
+    Lighting.Ambient = originalLighting.Ambient:Lerp(amb, level)
+    Lighting.OutdoorAmbient = originalLighting.OutdoorAmbient:Lerp(outAmb, level)
+    Lighting.ColorShift_Top = originalLighting.ColorShift_Top:Lerp(Color3.fromRGB(clamp(130 * pulseMul + 80 * flash, 0, 255), 0, 0), level)
+    Lighting.ColorShift_Bottom = originalLighting.ColorShift_Bottom:Lerp(Color3.fromRGB(70 * pulseMul, 0, 0), level)
+
+    Lighting.FogColor = originalLighting.FogColor:Lerp(Color3.fromRGB(clamp(70 + 60 * flash, 0, 255), 0, 0), level)
+    Lighting.FogStart = lerp(originalLighting.FogStart, 60, level)
+
+    local fogEndTarget = 1500 - fogThick * 800 + reveal * 500
+    local origEnd = math.max(originalLighting.FogEnd, 1)
+    Lighting.FogEnd = math.exp(lerp(math.log(origEnd), math.log(fogEndTarget), level))
+
+    Lighting.ExposureCompensation = originalLighting.ExposureCompensation + (-0.25 * level) + 0.3 * flash - 0.35 * dim
+
+    if atmosphereObj and atmosphereObj.Parent then
+        atmosphereObj.Density = lerp(originalAtmosphere.Density, 0.38 + 0.18 * fogThick, level)
+        atmosphereObj.Offset = lerp(originalAtmosphere.Offset, 0.25, level)
+        atmosphereObj.Color = originalAtmosphere.Color:Lerp(Color3.fromRGB(150 + 50 * flash, 10, 10), level)
+        atmosphereObj.Decay = originalAtmosphere.Decay:Lerp(Color3.fromRGB(190, 0, 0), level)
+        atmosphereObj.Glare = lerp(originalAtmosphere.Glare, 0, level)
+        atmosphereObj.Haze = lerp(originalAtmosphere.Haze, 2.2 + fogThick * 1.5, level)
+    end
+
+    if colorCorrection and colorCorrection.Parent then
+        colorCorrection.TintColor = Color3.new(1, 1, 1):Lerp(Color3.fromRGB(255, 150, 150), level)
+        colorCorrection.Saturation = -0.15 * level
+        colorCorrection.Contrast = 0.1 * level
+        colorCorrection.Brightness = -0.03 * level - 0.08 * dim + 0.05 * flash
+    end
+end
+
+local function restoreLighting()
+    if not lightingActive then
+        return
+    end
+
+    lightingActive = false
+
+    Lighting.Brightness = originalLighting.Brightness
+    Lighting.Ambient = originalLighting.Ambient
+    Lighting.OutdoorAmbient = originalLighting.OutdoorAmbient
+    Lighting.ColorShift_Top = originalLighting.ColorShift_Top
+    Lighting.ColorShift_Bottom = originalLighting.ColorShift_Bottom
+    Lighting.FogColor = originalLighting.FogColor
+    Lighting.FogStart = originalLighting.FogStart
+    Lighting.FogEnd = originalLighting.FogEnd
+    Lighting.ExposureCompensation = originalLighting.ExposureCompensation
+
+    if atmosphereObj then
+        if atmosphereCreated then
+            atmosphereObj:Destroy()
+        elseif atmosphereObj.Parent then
+            atmosphereObj.Density = originalAtmosphere.Density
+            atmosphereObj.Offset = originalAtmosphere.Offset
+            atmosphereObj.Color = originalAtmosphere.Color
+            atmosphereObj.Decay = originalAtmosphere.Decay
+            atmosphereObj.Glare = originalAtmosphere.Glare
+            atmosphereObj.Haze = originalAtmosphere.Haze
+        end
+    end
+    atmosphereObj = nil
+    atmosphereCreated = false
+
+    if colorCorrection then
+        colorCorrection:Destroy()
+        colorCorrection = nil
+    end
+
+    atmosphereLevel = 0
+end
+
+local function startAudio()
+    pcall(function()
+        sound:Play()
+    end)
+
+    for _, s in pairs(layerSounds) do
+        if s.Looped then
+            pcall(function()
+                s:Play()
+            end)
+        end
+    end
+end
+
+local function stopAudio()
+    pcall(function()
+        sound:Stop()
+    end)
+
+    for _, s in pairs(layerSounds) do
+        pcall(function()
+            s:Stop()
+        end)
+        if s.Looped then
+            s.Volume = 0
+        end
+    end
+
+    if roarSound then
+        pcall(function()
+            roarSound:Stop()
+        end)
+    end
+end
+
+local function updateAudio(now, dt)
+    local k = math.min(1, dt * 5)
+    local lvl = atmosphereLevel
+    local windSwell = samplePulse("windSwell", now)
+    local rumbleSwell = samplePulse("rumbleSwell", now)
+    local quake = math.min(samplePulse("quake", now), 1.5)
+    local breathe = 0.5 + 0.5 * math.sin(now * 0.5)
+    local gust = clamp(0.6 + math.noise(now * 0.35, 11) * 0.8, 0.15, 1)
+
+    local function setVol(s, target)
+        if s then
+            s.Volume = s.Volume + (target - s.Volume) * k
+        end
+    end
+
+    setVol(layerSounds.Drone, 0.9 * lvl * (0.85 + 0.15 * breathe))
+    setVol(layerSounds.Wind, 0.55 * lvl * gust * (1 + windSwell * 1.2))
+    setVol(layerSounds.Rumble, (0.5 + 1.6 * rumbleSwell + 0.6 * quake) * lvl)
+end
+
+local bCur = {}
+local bTgt = {}
+local behavior = {name = "idle", untilT = 0}
+local lastBehavior = ""
+
+local function resetBehaviorState()
+    local keys = {"headRoll", "headPitch", "headYaw", "armL", "armR", "tremble", "lift", "bodyYaw", "eyeBoost", "auraBoost", "jaw"}
+    for _, key in ipairs(keys) do
+        bCur[key] = 0
+        bTgt[key] = 0
+    end
+    behavior.name = "idle"
+    behavior.untilT = os.clock() + rand(2, 4)
+    lastBehavior = ""
+    nextBlinkTime = os.clock() + rand(2, 5)
+end
+
+local function playerYawRelativeToMonster()
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not (root and monsterWorldPosition) then
+        return 0
+    end
+    local rel = (CFrame.new(monsterWorldPosition) * monsterFacing):PointToObjectSpace(root.Position)
+    return math.atan2(-rel.X, -rel.Z)
+end
+
+local behaviorDefs = {
+    headTilt = {
+        w = 14,
+        dur = function() return rand(3, 5) end,
+        apply = function(t)
+            t.headRoll = (math.random() < 0.5 and -1 or 1) * rand(0.25, 0.45)
+            t.headPitch = rand(-0.12, 0.05)
+        end
+    },
+    stare = {
+        w = 10,
+        dur = function() return rand(4, 6) end,
+        apply = function(t)
+            t.headYaw = clamp(playerYawRelativeToMonster(), -0.7, 0.7)
+            t.headPitch = 0.08
+            t.eyeBoost = 0.8
+        end
+    },
+    raiseArm = {
+        w = 12,
+        dur = function() return rand(4, 6) end,
+        apply = function(t)
+            if math.random() < 0.5 then
+                t.armL = rand(0.5, 0.9)
+            else
+                t.armR = rand(0.5, 0.9)
+            end
+        end
+    },
+    raiseBoth = {
+        w = 6,
+        dur = function() return rand(4, 6) end,
+        apply = function(t)
+            t.armL = rand(0.35, 0.6)
+            t.armR = rand(0.35, 0.6)
+        end
+    },
+    tremble = {
+        w = 10,
+        dur = function() return rand(2, 4) end,
+        apply = function(t)
+            t.tremble = 1
+        end
+    },
+    rise = {
+        w = 8,
+        dur = function() return rand(4, 6) end,
+        apply = function(t)
+            t.lift = rand(10, 28)
+        end
+    },
+    sink = {
+        w = 6,
+        dur = function() return rand(3, 5) end,
+        apply = function(t)
+            t.lift = -rand(3, 7)
+        end
+    },
+    turn = {
+        w = 8,
+        dur = function() return rand(4, 6) end,
+        apply = function(t)
+            t.bodyYaw = (math.random() < 0.5 and -1 or 1) * rand(0.08, 0.2)
+        end
+    },
+    auraSurge = {
+        w = 8,
+        dur = function() return rand(3, 5) end,
+        apply = function(t)
+            t.auraBoost = 1
+            t.eyeBoost = 0.5
+        end
+    },
+    jawOpen = {
+        w = 6,
+        dur = function() return rand(2.5, 4) end,
+        apply = function(t)
+            t.jaw = rand(0.2, 0.35)
+        end
+    }
+}
+
+local behaviorList = {}
+for name, def in pairs(behaviorDefs) do
+    table.insert(behaviorList, {name = name, w = def.w})
+end
+
+local function weightedPick(list, filterFn)
+    local total = 0
+    for _, item in ipairs(list) do
+        if not filterFn or filterFn(item) then
+            total = total + item.w
+        end
+    end
+
+    if total <= 0 then
+        return nil
+    end
+
+    local r = math.random() * total
+    for _, item in ipairs(list) do
+        if not filterFn or filterFn(item) then
+            r = r - item.w
+            if r <= 0 then
+                return item
+            end
+        end
+    end
+    return nil
+end
+
+local function startBehavior(name, now)
+    local def = behaviorDefs[name]
+    if not def then
+        return
+    end
+
+    for key in pairs(bTgt) do
+        bTgt[key] = 0
+    end
+
+    def.apply(bTgt)
+    behavior.name = name
+    behavior.untilT = now + def.dur()
+    lastBehavior = name
+end
+
+local function stepBehavior(now)
+    if now < behavior.untilT then
+        return
+    end
+
+    if behavior.name == "idle" then
+        local picked = weightedPick(behaviorList, function(item)
+            return item.name ~= lastBehavior
+        end)
+        if picked then
+            startBehavior(picked.name, now)
+        end
+    else
+        for key in pairs(bTgt) do
+            bTgt[key] = 0
+        end
+        behavior.name = "idle"
+        behavior.untilT = now + rand(2.5, 5.5)
+    end
+end
+
+local function makeArmCF(s, raise, phase, now)
+    local pivot = Vector3.new(s * 13, 66, 0) * SCALE
+    local ang = raise * 1.1 + math.sin(now * 0.9 + phase) * 0.03
+    return CFrame.new(pivot) * CFrame.Angles(ang, 0, s * (raise * 0.35 + 0.02)) * CFrame.new(-pivot)
+end
+
+local function updateMonster(now, dt)
+    if not (monster and monster.Parent and monsterWorldPosition) then
+        return
+    end
+
+    stepBehavior(now)
+
+    local alpha = 1 - math.exp(-dt * 1.3)
+    for key, v in pairs(bCur) do
+        bCur[key] = v + (bTgt[key] - v) * alpha
+    end
+
+    if now >= nextBlinkTime then
+        startPulse("eyeBlink", 1, 0.04, 0.4)
+        nextBlinkTime = now + rand(2.5, 7)
+    end
+
+    local tremble = bCur.tremble
+    local shake = math.sin(now * 5) * 0.8 * SCALE * (0.35 + tremble)
+        + math.noise(now * 20, 3) * 2 * SCALE * tremble
+    local float = math.sin(now * 1.7) * 2 * SCALE * 0.7
+    local rotation = math.sin(now * 1.2) * 0.035
+    local sway = math.sin(now * 0.6) * 0.02
+
+    local stomp = samplePulse("stomp", now)
+    local reveal = samplePulse("reveal", now)
+    local flare = samplePulse("eyeFlare", now)
+    local blink = samplePulse("eyeBlink", now)
+    local roarLight = samplePulse("roarLight", now)
+
+    local approachOffset = Vector3.new(0, 0, 0)
+    if reveal > 0 then
+        approachOffset = approachDir * monsterApproachMax * math.min(reveal, 1)
+    end
+
+    local lift = bCur.lift - stomp * 4 * SCALE
+    local rootPos = monsterWorldPosition + approachOffset + Vector3.new(0, float + lift, 0)
+    local rootCF = CFrame.new(rootPos)
+        * monsterFacing
+        * CFrame.Angles(0, rotation + bCur.bodyYaw, sway)
+        * CFrame.new(shake, 0, 0)
+
+    monsterCurrentGround = monsterGroundPosition + approachOffset
+
+    local headPivot = Vector3.new(0, 84, -2) * SCALE
+    local headT = CFrame.new(headPivot)
+        * CFrame.Angles(bCur.headPitch, bCur.headYaw, bCur.headRoll)
+        * CFrame.new(-headPivot)
+
+    local jawOpen = clamp(bCur.jaw + samplePulse("jaw", now) * 0.45 + 0.03 * (math.sin(now * 1.1) * 0.5 + 0.5), 0, 0.6)
+    local jawPivot = Vector3.new(0, 87, -2) * SCALE
+    local jawT = headT
+        * CFrame.new(jawPivot)
+        * CFrame.Angles(-jawOpen, 0, 0)
+        * CFrame.new(-jawPivot)
+
+    groupCF.head = headT
+    groupCF.jaw = jawT
+    groupCF.armL = makeArmCF(-1, bCur.armL, 0, now)
+    groupCF.armR = makeArmCF(1, bCur.armR, 1.7, now)
+
+    for _, part in ipairs(monsterParts) do
+        if part and part.Parent then
+            local rel = monsterRel[part]
+
+            if rel then
+                part.CFrame = rootCF * groupCF[monsterGroup[part]] * rel
+            end
+        end
+    end
+
+    local baseEye = 0.65 + 0.2 * math.sin(now * 2.3)
+    local eyeLevel = clamp(baseEye + bCur.eyeBoost * 0.3 + flare * 0.9 - blink * 1.1, 0, 1.6)
+    local white = clamp((eyeLevel - 0.9) * 1.4, 0, 1)
+    local eyeColor = Color3.fromRGB(255, 20 + 170 * white, 20 + 150 * white)
+
+    for _, e in ipairs(monsterEyes) do
+        e.Color = eyeColor
+        e.Transparency = clamp(blink, 0, 1) * 0.85
+    end
+
+    if monsterMouthGlow then
+        monsterMouthGlow.Color = Color3.fromRGB(150 + 105 * clamp(jawOpen * 2 + roarLight, 0, 1), 0, 0)
+    end
+
+    if monsterLight then
+        monsterLight.Brightness = (12 + math.abs(math.sin(now * 4)) * 22)
+            * (1 + flare * 0.8 + bCur.auraBoost * 0.6 + roarLight * 0.8)
+    end
+
+    if monsterHighlight then
+        monsterHighlight.FillTransparency = clamp(0.8 - reveal * 0.25 - flare * 0.1 - bCur.auraBoost * 0.08, 0.45, 0.9)
+        monsterHighlight.OutlineTransparency = clamp(0.35 - reveal * 0.2, 0.05, 0.6)
+    end
+
+    glowFrameCounter = glowFrameCounter + 1
+    if glowFrameCounter % 2 == 0 then
+        local auraLevel = clamp(0.45 + 0.3 * (0.5 + 0.5 * math.sin(now * 0.8)) + 0.8 * flare + bCur.auraBoost * 0.5 + roarLight * 0.6 + reveal * 0.5, 0, 1.5)
+        local eyeGlowLevel = clamp(eyeLevel, 0, 1.5)
+
+        for _, g in ipairs(monsterGlow) do
+            local lvl = g.kind == "eye" and eyeGlowLevel or auraLevel
+            for i, f in ipairs(g.frames) do
+                f.BackgroundTransparency = clamp(1 - (1 - g.base[i]) * lvl, 0, 1)
+            end
+        end
+    end
+
+    if monsterShadow then
+        local sizeMul = 1 + math.max(lift, 0) * 0.003
+        monsterShadow.Size = Vector3.new(0.4, 230 * sizeMul, 140 * sizeMul)
+
+        local off = monsterFacing:VectorToWorldSpace(Vector3.new(
+            sway * 900 + shake * 0.5 + bCur.headRoll * 30,
+            0,
+            -(bCur.armL + bCur.armR) * 25
+        ))
+
+        monsterShadow.CFrame = CFrame.new(monsterCurrentGround + off + Vector3.new(0, 0.4, 0))
+            * monsterFacing
+            * CFrame.Angles(0, 0, math.rad(90))
+        monsterShadow.Transparency = clamp(0.55 + math.max(lift, 0) * 0.003, 0.4, 0.8)
+    end
+
+    if monsterFogPart then
+        monsterFogPart.CFrame = CFrame.new(monsterCurrentGround + Vector3.new(0, 12, 0))
+    end
+end
+
+local function forceBehavior(name)
+    startBehavior(name, os.clock())
+end
+
+local function eventBlackout()
+    local s = session
+    task.spawn(function()
+        local flickers = math.random(2, 3)
+        for _ = 1, flickers do
+            if s ~= session or not isActive then
+                return
+            end
+            startPulse("blackout", rand(0.4, 0.75), 0.06, rand(0.25, 0.45))
+            playSegment(layerSounds.Zap, 0.25, 2.2, 0.5)
+            task.wait(rand(0.45, 0.8))
+        end
+
+        if s ~= session or not isActive then
+            return
+        end
+
+        if math.random() < 0.5 then
+            startPulse("blackout", 0.9, 0.08, 1.3)
+            playSegment(layerSounds.Thump, 1.4, 0.22, 1.2)
+        end
+    end)
+end
+
+local function eventRedFlicker()
+    local s = session
+    startPulse("redFlash", 1, 0.35, 2.4)
+    startPulse("rumbleSwell", 0.6, 0.5, 2.5)
+    playSegment(layerSounds.Thump, 1.4, 0.25, 1.0)
+
+    task.delay(1.5, function()
+        if s == session and isActive then
+            startPulse("redFlash", 0.7, 0.3, 1.8)
+        end
+    end)
+end
+
+local function eventEyeFlare()
+    startPulse("eyeFlare", 1, 0.15, 2.6)
+    playSegment(layerSounds.Glint, 0.7, 1.4, 0.5)
+end
+
+local quakePresets = {
+    {w = 40, amp = 0.35, att = 0.25, dur = 1.3},
+    {w = 35, amp = 0.9, att = 0.3, dur = 2.6},
+    {w = 15, amp = 1.5, att = 0.4, dur = 3.6},
+    {w = 10, amp = 0.6, att = 1.2, dur = 6.5}
+}
+
+local function eventQuake()
+    local p = weightedPick(quakePresets)
+    if not p then
+        return
+    end
+
+    startPulse("quake", p.amp, p.att, p.dur)
+    startPulse("floorShake", math.min(1, p.amp / 1.2), p.att, p.dur)
+    startPulse("rumbleSwell", 1, p.att, p.dur + 1)
+
+    if p.amp >= 0.9 then
+        playSegment(layerSounds.Thump, 1.6, 0.22, 1.8)
+        startPulse("vignette", 0.35, 0.4, p.dur + 1)
+        startPulse("overlay", 0.18 + p.amp * 0.1, 0.4, p.dur + 1)
+    end
+
+    if p.amp >= 1.5 then
+        bloodTrace(3)
+    end
+end
+
+local function eventStomp()
+    startPulse("stomp", 1, 0.06, 1.0)
+    startPulse("quake", 1.0, 0.1, 2.2)
+    startPulse("floorShake", 0.8, 0.1, 2.2)
+    startPulse("rumbleSwell", 1, 0.2, 3)
+    startPulse("overlay", 0.15, 0.2, 2)
+    playSegment(layerSounds.Thump, 1.6, 0.22, 2.0)
+    spawnShockwave()
+end
+
+local function eventShockwave()
+    startPulse("floorShake", 0.4, 0.3, 2)
+    playSegment(layerSounds.Thump, 1.2, 0.3, 1.2)
+    spawnShockwave()
+end
+
+local function eventRoar()
+    if not (monster and roarSound) then
+        return
+    end
+
+    local s = session
+    playSegment(roarSound, 4, 0.28, 3.5)
+    startPulse("jaw", 1, 0.5, 3)
+    startPulse("roarLight", 1, 0.3, 3.5)
+    startPulse("eyeFlare", 1, 0.3, 3)
+    startPulse("redFlash", 0.8, 0.5, 3.2)
+    startPulse("overlay", 0.3, 0.6, 3.8)
+    startPulse("vignette", 0.5, 0.6, 4)
+    startPulse("quake", 0.7, 0.8, 4)
+    startPulse("floorShake", 0.6, 0.8, 4)
+    startPulse("windSwell", 1, 0.8, 4)
+    startPulse("rumbleSwell", 1, 0.8, 4)
+    bloodTrace(2)
+
+    task.delay(0.8, function()
+        if s == session and isActive then
+            spawnShockwave()
+        end
+    end)
+end
+
+local function eventFog()
+    startPulse("fogThick", 1, 5, 10)
+    startPulse("windSwell", 1, 4, 10)
+end
+
+local function eventFloorRed()
+    startPulse("floorHot", 1, 0.8, 5)
+    startPulse("floorShake", 0.6, 0.8, 5)
+    playSegment(layerSounds.Thump, 1.4, 0.25, 1.2)
+end
+
+local function eventReveal()
+    if not (monster and monsterWorldPosition) then
+        return
+    end
+
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then
+        local d = Vector3.new(root.Position.X - monsterWorldPosition.X, 0, root.Position.Z - monsterWorldPosition.Z)
+        if d.Magnitude > 1 then
+            approachDir = d.Unit
+        end
+    end
+
+    local s = session
+    startPulse("reveal", 1, 3, 7)
+    startPulse("eyeFlare", 1, 0.6, 5)
+    startPulse("vignette", 0.3, 2, 6)
+    forceBehavior("stare")
+
+    if math.random() < 0.5 then
+        task.delay(2.5, function()
+            if s == session and isActive then
+                eventRoar()
+            end
+        end)
+    end
+end
+
+local function eventBlood()
+    bloodTrace(3)
+    startPulse("vignette", 0.25, 0.5, 3)
+end
+
+local events = {
+    {name = "headTilt", w = 12, cd = 12, run = function() forceBehavior("headTilt") end},
+    {name = "stare", w = 10, cd = 20, run = function() forceBehavior("stare") end},
+    {name = "blackout", w = 12, cd = 25, run = eventBlackout},
+    {name = "redFlicker", w = 10, cd = 25, run = eventRedFlicker},
+    {name = "eyeFlare", w = 12, cd = 18, run = eventEyeFlare},
+    {name = "quake", w = 14, cd = 14, run = eventQuake},
+    {name = "stomp", w = 8, cd = 30, run = eventStomp},
+    {name = "shockwave", w = 6, cd = 30, run = eventShockwave},
+    {name = "roar", w = 7, cd = 50, run = eventRoar},
+    {name = "fog", w = 10, cd = 40, run = eventFog},
+    {name = "floorRed", w = 9, cd = 35, run = eventFloorRed},
+    {name = "reveal", w = 5, cd = 90, run = eventReveal},
+    {name = "blood", w = 6, cd = 30, run = eventBlood},
+    {name = "calm", w = 10, cd = 0, run = function() end}
+}
+
+local nextEventTime = 0
+local eventLastRun = {}
+
+local function runDirector(now)
+    if now < nextEventTime then
+        return
+    end
+
+    nextEventTime = now + rand(DIRECTOR_MIN_GAP, DIRECTOR_MAX_GAP)
+
+    local picked = weightedPick(events, function(e)
+        return now - (eventLastRun[e.name] or -1000) >= e.cd
+    end)
+
+    if picked then
+        eventLastRun[picked.name] = now
+        pcall(picked.run)
+    end
+end
+
+local renderConnection
+local slowAcc = 0
+
+renderConnection = RunService.RenderStepped:Connect(function(dt)
+    if not isActive then
+        return
+    end
+
+    local now = os.clock()
+
+    runDirector(now)
+    updateFloor(now)
+    updateMonster(now, dt)
+    followCamera()
+
+    slowAcc = slowAcc + dt
+    if slowAcc >= 0.05 then
+        local sdt = slowAcc
+        slowAcc = 0
+        updateLighting(now, sdt)
+        updateOverlay(now)
+        updateParticles(now)
+        updateAudio(now, sdt)
+    end
+end)
+
+local function cameraShakeStep()
+    if not isActive then
+        return
+    end
+
+    local camera = Workspace.CurrentCamera
+
+    if camera then
+        local t = os.clock()
+        local strength = earthquakeStrength + samplePulse("quake", t)
+
+        local earthquakeX = (math.sin(t * earthquakeSpeed) * 0.6 + math.noise(t * 7, 0.5) * 1.6) * strength
+        local earthquakeY = (math.sin(t * (earthquakeSpeed * 1.37)) * 0.6 + math.noise(t * 7, 1.5) * 1.6) * strength
+        local earthquakeZ = (math.cos(t * (earthquakeSpeed * 0.83)) * 0.6 + math.noise(t * 7, 2.5) * 1.6) * strength
+
+        camera.CFrame =
+            camera.CFrame
+            * CFrame.new(
+                earthquakeX,
+                earthquakeY,
+                earthquakeZ
+            )
+            * CFrame.Angles(
+                earthquakeY * 0.025,
+                earthquakeX * 0.025,
+                earthquakeZ * 0.025
+            )
+    end
+end
+
+pcall(function()
+    RunService:UnbindFromRenderStep("SystemCoreCameraShake")
+end)
+
+local function activateEffects()
+    session = session + 1
+    pulses = {}
+    resetBehaviorState()
+    eventLastRun = {}
+    nextEventTime = os.clock() + 4
+    slowAcc = 0
+
+    createWorldFX()
+    updateFloorList()
+    activateLighting()
+    createMonster()
+    createOverlayFX()
+    startAudio()
+
+    RunService:BindToRenderStep("SystemCoreCameraShake", Enum.RenderPriority.Camera.Value + 1, cameraShakeStep)
+end
+
+local function deactivateEffects()
+    session = session + 1
+    pulses = {}
+
+    pcall(function()
+        RunService:UnbindFromRenderStep("SystemCoreCameraShake")
+    end)
+
+    restoreOriginalState()
+    restoreLighting()
+    destroyMonster()
+    destroyWorldFX()
+    destroyOverlayFX()
+    stopAudio()
+end
+
+toggleButton.MouseButton1Click:Connect(function()
+    if dragMoved then
+        dragMoved = false
+        return
+    end
+
+    isActive = not isActive
+    updateButtonColor()
+
+    if isActive then
+        activateEffects()
+    else
+        deactivateEffects()
+    end
+end)
+
+local isShutdown = false
+
+local function shutdown()
+    if isShutdown then
+        return
+    end
+    isShutdown = true
+
+    isActive = false
+
+    if renderConnection then
+        renderConnection:Disconnect()
+    end
+
+    for _, c in ipairs(connections) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+
+    deactivateEffects()
+
+    pcall(function()
+        sound:Destroy()
+    end)
+
+    pcall(function()
+        audioFolder:Destroy()
+    end)
+
+    destroyOverlayFX()
+end
+
+screenGui.AncestryChanged:Connect(function()
+    if not screenGui.Parent then
+        shutdown()
+    end
+end)
+
+globalEnv.SystemCoreCleanup = function()
+    shutdown()
+    pcall(function()
+        screenGui:Destroy()
+    end)
+end
